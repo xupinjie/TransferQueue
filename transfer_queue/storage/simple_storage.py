@@ -136,8 +136,7 @@ class StorageUnitData:
         self._active_keys -= set(keys)
 
 
-@ray.remote(num_cpus=1)
-class SimpleStorageUnit:
+class SimpleStorageUnitBase:
     """A storage unit that provides distributed data storage functionality.
 
     This class represents a storage unit that can store data in a 2D structure
@@ -316,14 +315,20 @@ class SimpleStorageUnit:
                     elif operation == ZMQRequestType.LOAD_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
                         response_msg = self._handle_load_checkpoint(request_msg)
                     else:
-                        response_msg = ZMQMessage.create(
-                            request_type=ZMQRequestType.PUT_GET_OPERATION_ERROR,  # type: ignore[arg-type]
-                            sender_id=self.storage_unit_id,
-                            body={
-                                "message": f"Storage unit id #{self.storage_unit_id} "
-                                f"receive invalid operation: {operation}."
-                            },
-                        )
+                        # Give subclasses (e.g. NixlStorageUnit) a chance to handle extra
+                        # operations without duplicating the worker loop. Returns None here.
+                        extended_response = self._handle_extended_operation(operation, request_msg)
+                        if extended_response is not None:
+                            response_msg = extended_response
+                        else:
+                            response_msg = ZMQMessage.create(
+                                request_type=ZMQRequestType.PUT_GET_OPERATION_ERROR,  # type: ignore[arg-type]
+                                sender_id=self.storage_unit_id,
+                                body={
+                                    "message": f"Storage unit id #{self.storage_unit_id} "
+                                    f"receive invalid operation: {operation}."
+                                },
+                            )
                 except Exception as e:
                     logger.error(
                         f"[{self.storage_unit_id}]: worker error during {operation} "
@@ -344,6 +349,16 @@ class SimpleStorageUnit:
         logger.info(f"[{self.storage_unit_id}]: worker stopped.")
         poller.unregister(worker_socket)
         worker_socket.close(linger=0)
+
+    def _handle_extended_operation(self, operation, request_msg: ZMQMessage) -> ZMQMessage | None:
+        """Hook for subclasses to handle operations unknown to SimpleStorageUnit.
+
+        The base implementation handles nothing and returns None, which makes the
+        worker loop fall back to the standard ``PUT_GET_OPERATION_ERROR`` response.
+        Subclasses (e.g. ``NixlStorageUnit``) override this to add operations
+        without re-implementing ``_worker_routine``.
+        """
+        return None
 
     def _handle_put(self, data_parts: ZMQMessage) -> ZMQMessage:
         """
@@ -727,3 +742,13 @@ class SimpleStorageUnit:
             ZMQServerInfo containing connection details for this storage unit.
         """
         return self.zmq_server_info
+
+
+@ray.remote(num_cpus=1)
+class SimpleStorageUnit(SimpleStorageUnitBase):
+    """Ray actor form of :class:`SimpleStorageUnitBase`.
+
+    The implementation lives entirely in the plain base class so that other
+    backends (e.g. ``NixlStorageUnit``) can subclass the logic — Ray does not
+    allow inheriting from an already-decorated actor class.
+    """

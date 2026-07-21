@@ -13,7 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import mooncake_bootstrap, simple_storage_bootstrap, yuanrong_bootstrap  # noqa: F401, I001
+from . import (  # noqa: F401, I001
+    mooncake_bootstrap,
+    nixl_storage_bootstrap,
+    simple_storage_bootstrap,
+    yuanrong_bootstrap,
+)
 from .provider import StorageBootstrapProvider
 
 __all__ = [

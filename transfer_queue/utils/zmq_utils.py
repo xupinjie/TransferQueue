@@ -58,6 +58,21 @@ class ZMQRequestType(ExplicitEnum):
     GET_ERROR = "GET_ERROR"
     CLEAR_DATA_ERROR = "CLEAR_DATA_ERROR"
 
+    # NIXL_DATA_OPERATION
+    # One-time metadata exchange between NixlStorageManager (initiator) and NixlStorageUnit (target).
+    NIXL_HANDSHAKE = "NIXL_HANDSHAKE"
+    NIXL_HANDSHAKE_RESPONSE = "NIXL_HANDSHAKE_RESPONSE"
+    # PUT: manager WRITEs a serialized payload into a receive buffer the unit prepares, then commits.
+    PUT_DATA_NIXL = "PUT_DATA_NIXL"
+    PUT_DATA_NIXL_RESPONSE = "PUT_DATA_NIXL_RESPONSE"
+    PUT_DATA_NIXL_COMMIT = "PUT_DATA_NIXL_COMMIT"
+    PUT_DATA_NIXL_COMMIT_RESPONSE = "PUT_DATA_NIXL_COMMIT_RESPONSE"
+    # GET: manager READs a serialized payload the unit prepares, then releases the unit's buffer.
+    GET_DATA_NIXL = "GET_DATA_NIXL"
+    GET_DATA_NIXL_RESPONSE = "GET_DATA_NIXL_RESPONSE"
+    GET_DATA_NIXL_RELEASE = "GET_DATA_NIXL_RELEASE"
+    GET_DATA_NIXL_RELEASE_RESPONSE = "GET_DATA_NIXL_RELEASE_RESPONSE"
+
     # META_OPERATION
     GET_META = "GET_META"
     GET_META_RESPONSE = "GET_META_RESPONSE"

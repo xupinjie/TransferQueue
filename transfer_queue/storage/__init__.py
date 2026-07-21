@@ -16,20 +16,25 @@
 from .managers import (
     AsyncSimpleStorageManager,
     MooncakeStorageManager,
+    NixlStorageManager,
     RayStorageManager,
     StorageManager,
     StorageManagerFactory,
     YuanrongStorageManager,
 )
-from .simple_storage import SimpleStorageUnit, StorageUnitData
+from .nixl_storage import NixlStorageUnit
+from .simple_storage import SimpleStorageUnit, SimpleStorageUnitBase, StorageUnitData
 
 __all__ = [
     "SimpleStorageUnit",
+    "SimpleStorageUnitBase",
+    "NixlStorageUnit",
     "StorageUnitData",
     "StorageManager",
     "StorageManagerFactory",
     "AsyncSimpleStorageManager",
     "MooncakeStorageManager",
+    "NixlStorageManager",
     "YuanrongStorageManager",
     "RayStorageManager",
 ]
