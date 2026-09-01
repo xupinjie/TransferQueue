@@ -28,7 +28,7 @@ import zmq.asyncio
 
 from transfer_queue.utils.enum_utils import ExplicitEnum, Role
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.utils.serial_utils import decode, encode
+from transfer_queue.utils.serial_utils import DecodeStorageInfo, decode, decode_with_storage_info, encode
 
 logger = get_logger(__name__)
 
@@ -231,7 +231,29 @@ class ZMQMessage:
             result = decode(frames)
         except Exception as e:
             raise ZMQMessageDecodeError(f"{type(e).__name__}: {e}; {describe_frames(frames)}") from e
+        return cls._from_decoded(result)
 
+    @classmethod
+    def deserialize_with_storage_info(
+        cls,
+        frames: list,
+    ) -> tuple["ZMQMessage", DecodeStorageInfo]:
+        """Deserialize and retain buffer metadata needed by storage backends."""
+        if not frames:
+            raise ValueError("Empty frames received")
+
+        if frame_nbytes(frames[0]) == 0:
+            raise ZMQMessageDecodeError(f"leading frame is empty; {describe_frames(frames)}")
+
+        try:
+            result, storage_info = decode_with_storage_info(frames)
+        except Exception as e:
+            raise ZMQMessageDecodeError(f"{type(e).__name__}: {e}; {describe_frames(frames)}") from e
+        return cls._from_decoded(result), storage_info
+
+    @classmethod
+    def _from_decoded(cls, result: dict[str, Any]) -> "ZMQMessage":
+        """Build a message from the decoded wire dictionary."""
         return cls(
             request_type=ZMQRequestType(result["request_type"]),
             sender_id=result["sender_id"],

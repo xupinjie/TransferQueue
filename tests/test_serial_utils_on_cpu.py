@@ -97,6 +97,36 @@ def test_zmq_msg_serialization():
         )
 
 
+def test_zmq_deserialize_returns_storage_buffer_info():
+    from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
+
+    dense = torch.arange(24, dtype=torch.int64).view(3, 8)
+    variable = [torch.ones(2, dtype=torch.float32), torch.ones(5, dtype=torch.float32)]
+    msg = ZMQMessage.create(
+        request_type=ZMQRequestType.PUT_DATA,
+        sender_id="test",
+        body={"global_indexes": [1, 2, 3], "data": {"dense": dense, "variable": variable}},
+    )
+
+    decoded, storage_info = ZMQMessage.deserialize_with_storage_info(msg.serialize())
+    dense_buffer = storage_info.get_buffer(decoded.body["data"]["dense"])
+    assert dense_buffer is not None
+    assert dense_buffer.encoding == "tensor"
+    assert dense_buffer.dtype == "int64"
+    assert dense_buffer.shape == (3, 8)
+    assert memoryview(dense_buffer.buffer).nbytes == dense.numel() * dense.element_size()
+
+    for decoded_sample, original_sample in zip(
+        decoded.body["data"]["variable"],
+        variable,
+        strict=True,
+    ):
+        sample_buffer = storage_info.get_buffer(decoded_sample)
+        assert sample_buffer is not None
+        assert sample_buffer.shape == tuple(original_sample.shape)
+        assert memoryview(sample_buffer.buffer).nbytes == (original_sample.numel() * original_sample.element_size())
+
+
 @pytest.mark.parametrize(
     "make_view",
     [

@@ -19,6 +19,7 @@ import csv
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Any
 
 import ray
@@ -293,6 +294,8 @@ class TQThroughputTester:
         worker_node_ip: str | None = None,
         output_csv: str | None = None,
         use_complex_case: bool = False,
+        ssd_offload: bool = False,
+        ssd_path: str | None = None,
     ):
         """Initialize the throughput tester.
 
@@ -308,6 +311,8 @@ class TQThroughputTester:
             worker_node_ip: Worker node IP address (required for Yuanrong)
             output_csv: Path to output CSV file (optional)
             use_complex_case: Whether to use complex test case (nested + nontensor fields)
+            ssd_offload: Enable SimpleStorage SSD offload
+            ssd_path: Existing local SSD directory used when SSD offload is enabled
         """
         self.backend_config_path = backend_config_path
         self.backend_override = backend
@@ -320,12 +325,18 @@ class TQThroughputTester:
         self.worker_node_ip = worker_node_ip
         self.output_csv = output_csv
         self.use_complex_case = use_complex_case
+        self.ssd_offload_requested = ssd_offload
+        self.ssd_path_override = ssd_path
 
         # Prepare full config for tq.init()
         self.full_config = self._prepare_config()
 
         # Get backend from config
         self.backend = self.full_config["backend"]["storage_backend"]
+        simple_storage_config = self.full_config["backend"].get("SimpleStorage", {})
+        ssd_config = simple_storage_config.get("ssd_offload", {})
+        self.ssd_offload_enabled = self.backend == "SimpleStorage" and bool(ssd_config.get("enabled", False))
+        self.ssd_path = str(ssd_config["path"]) if self.ssd_offload_enabled else None
 
         # GDR is configured via backend.MooncakeStore.use_gdr (no separate CLI flag).
         self.use_gdr = bool(self.full_config["backend"].get("MooncakeStore", {}).get("use_gdr", False))
@@ -375,6 +386,26 @@ class TQThroughputTester:
         total_storage_size = self.global_batch_size * self.num_test_iterations
         if config.backend.storage_backend == "SimpleStorage":
             config.backend.SimpleStorage.total_storage_size = total_storage_size
+
+        if self.ssd_offload_requested:
+            if config.backend.storage_backend != "SimpleStorage":
+                raise ValueError("--ssd_offload is only supported by the SimpleStorage backend")
+            if not self.ssd_path_override:
+                raise ValueError("--ssd_offload requires --ssd_path")
+            config.backend.SimpleStorage.ssd_offload = {
+                "enabled": True,
+                "path": self.ssd_path_override,
+            }
+
+        if config.backend.storage_backend == "SimpleStorage":
+            ssd_config = config.backend.SimpleStorage.get("ssd_offload", None)
+            if ssd_config is not None and ssd_config.get("enabled", False):
+                ssd_path = ssd_config.get("path", None)
+                if not ssd_path or not Path(str(ssd_path)).is_dir():
+                    raise ValueError(
+                        f"SSD offload directory does not exist or is not a directory: {ssd_path!r}. "
+                        "Update --ssd_path to an existing local SSD directory."
+                    )
 
         return OmegaConf.to_container(config, resolve=True)
 
@@ -490,6 +521,9 @@ class TQThroughputTester:
         logger.info(f"Backend: {self.backend}")
         logger.info(f"Device: {self.device}")
         logger.info(f"GDR: {self.use_gdr}")
+        logger.info(f"SSD Offload: {self.ssd_offload_enabled}")
+        if self.ssd_offload_enabled:
+            logger.info(f"SSD Path: {self.ssd_path}")
         logger.info(f"Total Data Size: {self.total_data_size_gb:.6f} GB")
         logger.info(f"PUT Time: {put_time:.8f}s")
         logger.info(f"GET Time: {get_time:.8f}s")
@@ -499,10 +533,11 @@ class TQThroughputTester:
         logger.info("=" * 60)
 
         # Return results (only Gb/s for CSV, not GB/s)
-        return {
+        result = {
             "backend": self.backend,
             "device": self.device,
             "use_gdr": self.use_gdr,
+            "ssd_offload": self.ssd_offload_enabled,
             "total_data_size_gb": self.total_data_size_gb,
             "put_time": put_time,
             "get_time": get_time,
@@ -510,6 +545,7 @@ class TQThroughputTester:
             "get_gbit_per_sec": get_gbit_per_sec,
             "total_gbit_per_sec": total_gbit_per_sec,
         }
+        return result
 
     def close(self) -> None:
         """Close the transfer_queue clients."""
@@ -607,6 +643,18 @@ def main() -> None:
         default=False,
         help="Use complex test case with nested tensors and nontensor fields (default: False, simple case)",
     )
+    parser.add_argument(
+        "--ssd_offload",
+        action="store_true",
+        default=False,
+        help=("Enable SimpleStorage SSD offload. Requires --ssd_path."),
+    )
+    parser.add_argument(
+        "--ssd_path",
+        type=str,
+        default=None,
+        help="Existing local SSD directory used by --ssd_offload.",
+    )
 
     args = parser.parse_args()
 
@@ -623,6 +671,8 @@ def main() -> None:
         worker_node_ip=args.worker_node_ip,
         output_csv=args.output_csv,
         use_complex_case=args.use_complex_case,
+        ssd_offload=args.ssd_offload,
+        ssd_path=args.ssd_path,
     )
 
     # Run test multiple times for consistent results using a for loop

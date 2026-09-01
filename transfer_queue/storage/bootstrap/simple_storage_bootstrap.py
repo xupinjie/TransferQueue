@@ -15,6 +15,7 @@
 
 import math
 from typing import Any
+from uuid import uuid4
 
 from omegaconf import DictConfig
 
@@ -44,12 +45,17 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
         math.ceil(total_storage_size / num_data_storage_units) if total_storage_size is not None else None
     )
 
+    ssd_config = conf.backend.SimpleStorage.get("ssd_offload", None)
+    ssd_run_id = uuid4().hex if ssd_config is not None and ssd_config.get("enabled", False) else None
+
     for storage_unit_rank in range(num_data_storage_units):
         storage_node = SimpleStorageUnit.options(  # type: ignore[attr-defined]
             scheduling_strategy=scheduling_strategies[storage_unit_rank],
             name=f"TransferQueueStorageUnit#{storage_unit_rank}",
         ).remote(
             storage_unit_size=storage_unit_size,
+            ssd_config=ssd_config,
+            ssd_run_id=ssd_run_id,
         )
         simple_storage_handles[f"TransferQueueStorageUnit#{storage_unit_rank}"] = storage_node
         logger.info(
