@@ -14,22 +14,102 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import argparse
 import csv
 import logging
 import os
 import time
+import urllib.request
+from pathlib import Path
 from typing import Any
 
 import ray
 import torch
 from omegaconf import OmegaConf
+from prometheus_client.parser import text_string_to_metric_families
 from tensordict import NonTensorStack, TensorDict
 
 import transfer_queue as tq
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+STORAGE_METRICS_TIMEOUT_SECONDS = 30
+
+
+def read_storage_metrics(endpoint: str) -> dict[str, dict[str, int]]:
+    """Read per-unit SimpleStorage gauges from the Prometheus endpoint."""
+    with urllib.request.urlopen(f"http://{endpoint}/metrics", timeout=5) as response:
+        payload = response.read().decode("utf-8")
+
+    names = {
+        "tq_storage_active_keys_total": "active_keys",
+        "tq_storage_memory_rss_bytes": "rss_bytes",
+        "tq_storage_ssd_active_bytes": "ssd_active_bytes",
+    }
+    units: dict[str, dict[str, int]] = {}
+    for family in text_string_to_metric_families(payload):
+        for sample in family.samples:
+            key = names.get(sample.name)
+            storage_unit_id = sample.labels.get("storage_unit_id")
+            if key is not None and storage_unit_id is not None:
+                units.setdefault(storage_unit_id, {})[key] = int(sample.value)
+    return units
+
+
+def wait_for_storage_metrics(
+    endpoint: str,
+    expected_active_keys: int,
+    expected_storage_units: int,
+    timeout_seconds: float = STORAGE_METRICS_TIMEOUT_SECONDS,
+) -> dict[str, int]:
+    """Wait for a metrics collection that reflects the requested storage state."""
+    deadline = time.monotonic() + timeout_seconds
+    last_active_keys = None
+    last_storage_units = 0
+    last_unit_fields = None
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            units = read_storage_metrics(endpoint)
+            last_storage_units = len(units)
+            last_unit_fields = sorted({tuple(sorted(values)) for values in units.values()})
+            last_error = None
+        except OSError as e:
+            last_error = str(e)
+            time.sleep(0.5)
+            continue
+        complete = len(units) == expected_storage_units and all(
+            "active_keys" in values and "rss_bytes" in values for values in units.values()
+        )
+        if complete:
+            last_active_keys = sum(values["active_keys"] for values in units.values())
+            if last_active_keys == expected_active_keys:
+                return {
+                    "rss_bytes": sum(values["rss_bytes"] for values in units.values()),
+                    "ssd_active_bytes": sum(values.get("ssd_active_bytes", 0) for values in units.values()),
+                }
+        time.sleep(0.5)
+    raise TimeoutError(
+        f"Storage metrics did not reach active_keys={expected_active_keys} within {timeout_seconds}s "
+        f"(active_keys={last_active_keys}, units={last_storage_units}/{expected_storage_units}, "
+        f"unit_fields={last_unit_fields}, last_error={last_error!r})"
+    )
 
 
 def create_test_case(
@@ -272,6 +352,10 @@ class TQClientActor:
             keys = self.test_keys
         tq.kv_clear(keys=keys, partition_id=partition_id)
 
+    def get_metrics_endpoint(self) -> str | None:
+        """Return the shared Prometheus endpoint."""
+        return tq.get_metrics_endpoint()
+
     def close(self) -> None:
         """Close transfer_queue."""
         tq.close()
@@ -293,6 +377,8 @@ class TQThroughputTester:
         worker_node_ip: str | None = None,
         output_csv: str | None = None,
         use_complex_case: bool = False,
+        ssd_offload: bool = False,
+        ssd_path: str | None = None,
     ):
         """Initialize the throughput tester.
 
@@ -308,6 +394,8 @@ class TQThroughputTester:
             worker_node_ip: Worker node IP address (required for Yuanrong)
             output_csv: Path to output CSV file (optional)
             use_complex_case: Whether to use complex test case (nested + nontensor fields)
+            ssd_offload: Enable SimpleStorage SSD offload
+            ssd_path: Existing local SSD directory used when SSD offload is enabled
         """
         self.backend_config_path = backend_config_path
         self.backend_override = backend
@@ -320,12 +408,18 @@ class TQThroughputTester:
         self.worker_node_ip = worker_node_ip
         self.output_csv = output_csv
         self.use_complex_case = use_complex_case
+        self.ssd_offload_requested = ssd_offload
+        self.ssd_path_override = ssd_path
 
         # Prepare full config for tq.init()
         self.full_config = self._prepare_config()
 
         # Get backend from config
         self.backend = self.full_config["backend"]["storage_backend"]
+        simple_storage_config = self.full_config["backend"].get("SimpleStorage", {})
+        ssd_config = simple_storage_config.get("ssd_offload", {})
+        self.ssd_offload_enabled = self.backend == "SimpleStorage" and bool(ssd_config.get("enabled", False))
+        self.ssd_path = str(ssd_config["path"]) if self.ssd_offload_enabled else None
 
         # GDR is configured via backend.MooncakeStore.use_gdr (no separate CLI flag).
         self.use_gdr = bool(self.full_config["backend"].get("MooncakeStore", {}).get("use_gdr", False))
@@ -376,6 +470,26 @@ class TQThroughputTester:
         if config.backend.storage_backend == "SimpleStorage":
             config.backend.SimpleStorage.total_storage_size = total_storage_size
 
+        if self.ssd_offload_requested:
+            if config.backend.storage_backend != "SimpleStorage":
+                raise ValueError("--ssd_offload is only supported by the SimpleStorage backend")
+            if not self.ssd_path_override:
+                raise ValueError("--ssd_offload requires --ssd_path")
+            config.backend.SimpleStorage.ssd_offload = {
+                "enabled": True,
+                "path": self.ssd_path_override,
+            }
+
+        if config.backend.storage_backend == "SimpleStorage":
+            ssd_config = config.backend.SimpleStorage.get("ssd_offload", None)
+            if ssd_config is not None and ssd_config.get("enabled", False):
+                ssd_path = ssd_config.get("path", None)
+                if not ssd_path or not Path(str(ssd_path)).is_dir():
+                    raise ValueError(
+                        f"SSD offload directory does not exist or is not a directory: {ssd_path!r}. "
+                        "Update --ssd_path to an existing local SSD directory."
+                    )
+
         return OmegaConf.to_container(config, resolve=True)
 
     def _initialize_clients(self) -> None:
@@ -422,6 +536,15 @@ class TQThroughputTester:
         # Writer first: ensures storage bootstrap binds to the head address before reader attaches.
         ray.get(self.writer.initialize.remote())
         ray.get(self.reader.initialize.remote())
+        self.metrics_endpoint = None
+        self.num_storage_units = 0
+        if self.backend == "SimpleStorage":
+            self.metrics_endpoint = ray.get(self.writer.get_metrics_endpoint.remote())
+            if self.metrics_endpoint:
+                self.num_storage_units = self.full_config["backend"]["SimpleStorage"]["num_data_storage_units"]
+                logger.info(f"Storage metrics endpoint: http://{self.metrics_endpoint}/metrics")
+            else:
+                logger.warning("Storage RSS is unavailable because metrics are disabled")
 
     def run_throughput_test(self, skip_dataset_create=False) -> dict[str, Any]:
         """Run the throughput test and print results.
@@ -446,6 +569,13 @@ class TQThroughputTester:
             logger.info(f"Data creation time: {end_create_data - start_create_data:.8f}s")
 
         partition_id = "train_0"
+        rss_before_put = None
+        if self.metrics_endpoint:
+            rss_before_put = wait_for_storage_metrics(
+                self.metrics_endpoint,
+                expected_active_keys=0,
+                expected_storage_units=self.num_storage_units,
+            )
 
         # PUT operation using kv_batch_put
         logger.info("Starting PUT operation (kv_batch_put)...")
@@ -457,6 +587,13 @@ class TQThroughputTester:
         put_gbyte_per_sec = self.total_data_size_gb / put_time
 
         time.sleep(2)
+        rss_after_put = None
+        if self.metrics_endpoint:
+            rss_after_put = wait_for_storage_metrics(
+                self.metrics_endpoint,
+                expected_active_keys=self.global_batch_size,
+                expected_storage_units=self.num_storage_units,
+            )
 
         # LIST_KEYS operation using kv_list
         logger.info("Starting LIST_KEYS operation (kv_list)...")
@@ -479,6 +616,13 @@ class TQThroughputTester:
         # DELETE operation using kv_clear
         logger.info("Starting DELETE operation (kv_clear)...")
         ray.get(self.writer.delete.remote(partition_id=partition_id, keys=keys))
+        rss_after_clear = None
+        if self.metrics_endpoint:
+            rss_after_clear = wait_for_storage_metrics(
+                self.metrics_endpoint,
+                expected_active_keys=0,
+                expected_storage_units=self.num_storage_units,
+            )
 
         # Print summary
         total_gbit_per_sec = (self.total_data_size_gb * 16) / (put_time + get_time)
@@ -490,19 +634,31 @@ class TQThroughputTester:
         logger.info(f"Backend: {self.backend}")
         logger.info(f"Device: {self.device}")
         logger.info(f"GDR: {self.use_gdr}")
+        logger.info(f"SSD Offload: {self.ssd_offload_enabled}")
+        if self.ssd_offload_enabled:
+            logger.info(f"SSD Path: {self.ssd_path}")
         logger.info(f"Total Data Size: {self.total_data_size_gb:.6f} GB")
         logger.info(f"PUT Time: {put_time:.8f}s")
         logger.info(f"GET Time: {get_time:.8f}s")
         logger.info(f"PUT Throughput: {put_gbit_per_sec:.8f} Gb/s ({put_gbyte_per_sec:.8f} GB/s)")
         logger.info(f"GET Throughput: {get_gbit_per_sec:.8f} Gb/s ({get_gbyte_per_sec:.8f} GB/s)")
         logger.info(f"Total Throughput: {total_gbit_per_sec:.8f} Gb/s ({total_gbyte_per_sec:.8f} GB/s)")
+        if rss_before_put and rss_after_put and rss_after_clear:
+            logger.info(f"Storage RSS before PUT: {rss_before_put['rss_bytes'] / 2**30:.3f} GiB")
+            logger.info(f"Storage RSS after PUT: {rss_after_put['rss_bytes'] / 2**30:.3f} GiB")
+            logger.info(f"Storage RSS after CLEAR: {rss_after_clear['rss_bytes'] / 2**30:.3f} GiB")
+            logger.info(
+                f"Storage RSS retained after CLEAR: "
+                f"{(rss_after_clear['rss_bytes'] - rss_before_put['rss_bytes']) / 2**20:.1f} MiB"
+            )
         logger.info("=" * 60)
 
         # Return results (only Gb/s for CSV, not GB/s)
-        return {
+        result = {
             "backend": self.backend,
             "device": self.device,
             "use_gdr": self.use_gdr,
+            "ssd_offload": self.ssd_offload_enabled,
             "total_data_size_gb": self.total_data_size_gb,
             "put_time": put_time,
             "get_time": get_time,
@@ -510,6 +666,19 @@ class TQThroughputTester:
             "get_gbit_per_sec": get_gbit_per_sec,
             "total_gbit_per_sec": total_gbit_per_sec,
         }
+        if rss_before_put and rss_after_put and rss_after_clear:
+            result.update(
+                {
+                    "storage_rss_before_put_bytes": rss_before_put["rss_bytes"],
+                    "storage_rss_after_put_bytes": rss_after_put["rss_bytes"],
+                    "storage_rss_after_clear_bytes": rss_after_clear["rss_bytes"],
+                    "storage_rss_retained_after_clear_bytes": (
+                        rss_after_clear["rss_bytes"] - rss_before_put["rss_bytes"]
+                    ),
+                    "storage_ssd_active_bytes_after_put": rss_after_put["ssd_active_bytes"],
+                }
+            )
+        return result
 
     def close(self) -> None:
         """Close the transfer_queue clients."""
@@ -607,7 +776,18 @@ def main() -> None:
         default=False,
         help="Use complex test case with nested tensors and nontensor fields (default: False, simple case)",
     )
-
+    parser.add_argument(
+        "--ssd_offload",
+        action="store_true",
+        default=False,
+        help=("Enable SimpleStorage SSD offload. Requires --ssd_path."),
+    )
+    parser.add_argument(
+        "--ssd_path",
+        type=str,
+        default=None,
+        help="Existing local SSD directory used by --ssd_offload.",
+    )
     args = parser.parse_args()
 
     # Create and run tester
@@ -623,6 +803,8 @@ def main() -> None:
         worker_node_ip=args.worker_node_ip,
         output_csv=args.output_csv,
         use_complex_case=args.use_complex_case,
+        ssd_offload=args.ssd_offload,
+        ssd_path=args.ssd_path,
     )
 
     # Run test multiple times for consistent results using a for loop

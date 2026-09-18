@@ -35,6 +35,21 @@ backend:
     # ZMQ Server IP & Ports (automatically generated during init)
     zmq_info: null
 
+    # SSD offload reduces the long-lived host-memory footprint by keeping large
+    # fields on local SSD. Small fields remain in memory.
+    # Each offloaded (field, global_index) sample owns one temporary file so
+    # CLEAR can reclaim its disk space immediately.
+    ssd_offload:
+      # Master switch. Set to true to enable SSD offload.
+      enabled: false
+      # Required when enabled. TransferQueue creates this directory and any
+      # missing parents on every storage node, stores data under its
+      # transfer_queue_ssd_offload/ child, and leaves this directory intact on close.
+      # Example: /path/to/local/ssd
+      path: null
+      # Samples at or above this encoded size are stored on SSD.
+      threshold_bytes: 1048576
+
   # MooncakeStore: high-performance KV-based hierarchical storage
   # that supports RDMA transport between GPU and DRAM.
   MooncakeStore:
